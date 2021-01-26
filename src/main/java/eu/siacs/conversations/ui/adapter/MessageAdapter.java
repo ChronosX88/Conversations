@@ -210,9 +210,12 @@ public class MessageAdapter extends ArrayAdapter<Message> {
                 info = getContext().getString(R.string.offering);
                 break;
             case Message.STATUS_SEND_RECEIVED:
-            case Message.STATUS_SEND_DISPLAYED:
                 viewHolder.indicatorReceived.setImageResource(darkBackground ? R.drawable.ic_done_white_18dp : R.drawable.ic_done_black_18dp);
                 viewHolder.indicatorReceived.setAlpha(darkBackground ? 0.7f : 0.57f);
+                viewHolder.indicatorReceived.setVisibility(View.VISIBLE);
+                break;
+            case Message.STATUS_SEND_DISPLAYED:
+                viewHolder.indicatorReceived.setImageResource(R.drawable.ic_done_all_blue_18dp);
                 viewHolder.indicatorReceived.setVisibility(View.VISIBLE);
                 break;
             case Message.STATUS_SEND_FAILED:
@@ -711,7 +714,7 @@ public class MessageAdapter extends ArrayAdapter<Message> {
             viewHolder.indicatorReceived.setAlpha(isDarkTheme ? 0.7f : 0.57f);
             viewHolder.message_box.setBackgroundResource(isDarkTheme ? R.drawable.date_bubble_grey : R.drawable.date_bubble_white);
             return view;
-        } else if (type == STATUS) {
+        } else if (type == STATUS && !message.getBody().equals("READ_NOTIF")) {
             if ("LOAD_MORE".equals(message.getBody())) {
                 viewHolder.status_message.setVisibility(View.GONE);
                 viewHolder.contact_picture.setVisibility(View.GONE);

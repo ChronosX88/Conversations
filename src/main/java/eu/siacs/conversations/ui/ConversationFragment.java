@@ -2496,21 +2496,6 @@ public class ConversationFragment extends XmppFragment implements EditMessage.Ke
                 this.messageList.add(Message.createStatusMessage(conversation, getString(R.string.contact_is_typing, conversation.getName())));
             } else if (state == ChatState.PAUSED) {
                 this.messageList.add(Message.createStatusMessage(conversation, getString(R.string.contact_has_stopped_typing, conversation.getName())));
-            } else {
-                for (int i = this.messageList.size() - 1; i >= 0; --i) {
-                    final Message message = this.messageList.get(i);
-                    if (message.getType() != Message.TYPE_STATUS) {
-                        if (message.getStatus() == Message.STATUS_RECEIVED) {
-                            return;
-                        } else {
-                            if (message.getStatus() == Message.STATUS_SEND_DISPLAYED) {
-                                this.messageList.add(i + 1,
-                                        Message.createStatusMessage(conversation, getString(R.string.contact_has_read_up_to_this_point, conversation.getName())));
-                                return;
-                            }
-                        }
-                    }
-                }
             }
         } else {
             final MucOptions mucOptions = conversation.getMucOptions();
