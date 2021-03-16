@@ -30,6 +30,9 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import eu.siacs.conversations.Config;
+import eu.siacs.conversations.crypto.axolotl.AxolotlService;
+import eu.siacs.conversations.crypto.axolotl.CryptoFailedException;
+import eu.siacs.conversations.crypto.axolotl.FingerprintStatus;
 import eu.siacs.conversations.entities.Account;
 import eu.siacs.conversations.entities.Conversation;
 import eu.siacs.conversations.entities.Conversational;
@@ -43,6 +46,7 @@ import eu.siacs.conversations.xmpp.Jid;
 import eu.siacs.conversations.xmpp.jingle.stanzas.Group;
 import eu.siacs.conversations.xmpp.jingle.stanzas.IceUdpTransportInfo;
 import eu.siacs.conversations.xmpp.jingle.stanzas.JinglePacket;
+import eu.siacs.conversations.xmpp.jingle.stanzas.Proceed;
 import eu.siacs.conversations.xmpp.jingle.stanzas.Propose;
 import eu.siacs.conversations.xmpp.jingle.stanzas.Reason;
 import eu.siacs.conversations.xmpp.jingle.stanzas.RtpDescription;
@@ -60,6 +64,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
     private static final List<State> TERMINATED = Arrays.asList(
             State.ACCEPTED,
             State.REJECTED,
+            State.REJECTED_RACED,
             State.RETRACTED,
             State.RETRACTED_RACED,
             State.TERMINATED_SUCCESS,
@@ -87,6 +92,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                 State.TERMINATED_CONNECTIVITY_ERROR //only used when the xmpp connection rebinds
         ));
         transitionBuilder.put(State.PROCEED, ImmutableList.of(
+                State.REJECTED_RACED,
                 State.RETRACTED_RACED,
                 State.SESSION_INITIALIZED_PRE_APPROVED,
                 State.TERMINATED_SUCCESS,
@@ -121,6 +127,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
 
     private final WebRTCWrapper webRTCWrapper = new WebRTCWrapper(this);
     private final ArrayDeque<Set<Map.Entry<String, RtpContentMap.DescriptionTransport>>> pendingIceCandidates = new ArrayDeque<>();
+    private final OmemoVerification omemoVerification = new OmemoVerification();
     private final Message message;
     private State state = State.NULL;
     private StateTransitionException stateTransitionException;
@@ -288,6 +295,25 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
     }
 
+    private RtpContentMap receiveRtpContentMap(final JinglePacket jinglePacket, final boolean expectVerification) {
+        final RtpContentMap receivedContentMap = RtpContentMap.of(jinglePacket);
+        if (receivedContentMap instanceof OmemoVerifiedRtpContentMap) {
+            final AxolotlService.OmemoVerifiedPayload<RtpContentMap> omemoVerifiedPayload;
+            try {
+                omemoVerifiedPayload = id.account.getAxolotlService().decrypt((OmemoVerifiedRtpContentMap) receivedContentMap, id.with);
+            } catch (final CryptoFailedException e) {
+                throw new SecurityException("Unable to verify DTLS Fingerprint with OMEMO", e);
+            }
+            this.omemoVerification.setOrEnsureEqual(omemoVerifiedPayload);
+            Log.d(Config.LOGTAG,id.account.getJid().asBareJid()+": received verifiable DTLS fingerprint via "+this.omemoVerification);
+            return omemoVerifiedPayload.getPayload();
+        } else if (expectVerification) {
+            throw new SecurityException("DTLS fingerprint was unexpectedly not verifiable");
+        } else {
+            return receivedContentMap;
+        }
+    }
+
     private void receiveSessionInitiate(final JinglePacket jinglePacket) {
         if (isInitiator()) {
             Log.d(Config.LOGTAG, String.format("%s: received session-initiate even though we were initiating", id.account.getJid().asBareJid()));
@@ -296,7 +322,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
         final RtpContentMap contentMap;
         try {
-            contentMap = RtpContentMap.of(jinglePacket);
+            contentMap = receiveRtpContentMap(jinglePacket, false);
             contentMap.requireContentDescriptions();
             contentMap.requireDTLSFingerprint();
         } catch (final RuntimeException e) {
@@ -326,7 +352,11 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
         if (transition(target, () -> this.initiatorRtpContentMap = contentMap)) {
             respondOk(jinglePacket);
-            pendingIceCandidates.push(contentMap.contents.entrySet());
+
+            final Set<Map.Entry<String, RtpContentMap.DescriptionTransport>> candidates = contentMap.contents.entrySet();
+            if (candidates.size() > 0) {
+                pendingIceCandidates.push(candidates);
+            }
             if (target == State.SESSION_INITIALIZED_PRE_APPROVED) {
                 Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": automatically accepting session-initiate");
                 sendSessionAccept();
@@ -348,7 +378,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
         final RtpContentMap contentMap;
         try {
-            contentMap = RtpContentMap.of(jinglePacket);
+            contentMap = receiveRtpContentMap(jinglePacket, this.omemoVerification.hasFingerprint());
             contentMap.requireContentDescriptions();
             contentMap.requireDTLSFingerprint();
         } catch (final RuntimeException e) {
@@ -467,7 +497,20 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
     private void sendSessionAccept(final RtpContentMap rtpContentMap) {
         this.responderRtpContentMap = rtpContentMap;
         this.transitionOrThrow(State.SESSION_ACCEPTED);
-        final JinglePacket sessionAccept = rtpContentMap.toJinglePacket(JinglePacket.Action.SESSION_ACCEPT, id.sessionId);
+        final RtpContentMap outgoingContentMap;
+        if (this.omemoVerification.hasDeviceId()) {
+            final AxolotlService.OmemoVerifiedPayload<OmemoVerifiedRtpContentMap> verifiedPayload;
+            try {
+                verifiedPayload = id.account.getAxolotlService().encrypt(rtpContentMap, id.with, omemoVerification.getDeviceId());
+                outgoingContentMap = verifiedPayload.getPayload();
+                this.omemoVerification.setOrEnsureEqual(verifiedPayload);
+            } catch (final Exception e) {
+                throw new SecurityException("Unable to verify DTLS Fingerprint with OMEMO", e);
+            }
+        } else {
+            outgoingContentMap = rtpContentMap;
+        }
+        final JinglePacket sessionAccept = outgoingContentMap.toJinglePacket(JinglePacket.Action.SESSION_ACCEPT, id.sessionId);
         send(sessionAccept);
     }
 
@@ -478,7 +521,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                 receivePropose(from, Propose.upgrade(message), serverMessageId, timestamp);
                 break;
             case "proceed":
-                receiveProceed(from, serverMessageId, timestamp);
+                receiveProceed(from, Proceed.upgrade(message), serverMessageId, timestamp);
                 break;
             case "retract":
                 receiveRetract(from, serverMessageId, timestamp);
@@ -523,31 +566,55 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
     }
 
-    private void receiveReject(Jid from, String serverMsgId, long timestamp) {
+    private void receiveReject(final Jid from, final String serverMsgId, final long timestamp) {
         final boolean originatedFromMyself = from.asBareJid().equals(id.account.getJid().asBareJid());
         //reject from another one of my clients
         if (originatedFromMyself) {
-            if (transition(State.REJECTED)) {
-                this.xmppConnectionService.getNotificationService().cancelIncomingCallNotification();
-                this.finish();
-                if (serverMsgId != null) {
-                    this.message.setServerMsgId(serverMsgId);
-                }
-                this.message.setTime(timestamp);
-                this.message.setCarbon(true); //indicate that call was rejected on other device
-                writeLogMessageMissed();
+            receiveRejectFromMyself(serverMsgId, timestamp);
+        } else if (isInitiator()) {
+            if (from.equals(id.with)) {
+                receiveRejectFromResponder();
             } else {
-                Log.d(Config.LOGTAG, "not able to transition into REJECTED because already in " + this.state);
+                Log.d(Config.LOGTAG, id.account.getJid() + ": ignoring reject from " + from + " for session with " + id.with);
             }
         } else {
             Log.d(Config.LOGTAG, id.account.getJid() + ": ignoring reject from " + from + " for session with " + id.with);
         }
     }
 
+    private void receiveRejectFromMyself(String serverMsgId, long timestamp) {
+        if (transition(State.REJECTED)) {
+            this.xmppConnectionService.getNotificationService().cancelIncomingCallNotification();
+            this.finish();
+            if (serverMsgId != null) {
+                this.message.setServerMsgId(serverMsgId);
+            }
+            this.message.setTime(timestamp);
+            this.message.setCarbon(true); //indicate that call was rejected on other device
+            writeLogMessageMissed();
+        } else {
+            Log.d(Config.LOGTAG, "not able to transition into REJECTED because already in " + this.state);
+        }
+    }
+
+    private void receiveRejectFromResponder() {
+        if (isInState(State.PROCEED)) {
+            Log.d(Config.LOGTAG, id.account.getJid() + ": received reject while still in proceed. callee reconsidered");
+            closeTransitionLogFinish(State.REJECTED_RACED);
+            return;
+        }
+        if (isInState(State.SESSION_INITIALIZED_PRE_APPROVED)) {
+            Log.d(Config.LOGTAG, id.account.getJid() + ": received reject while in SESSION_INITIATED_PRE_APPROVED. callee reconsidered before receiving session-init");
+            closeTransitionLogFinish(State.TERMINATED_DECLINED_OR_BUSY);
+            return;
+        }
+        Log.d(Config.LOGTAG, id.account.getJid() + ": ignoring reject from responder because already in state " + this.state);
+    }
+
     private void receivePropose(final Jid from, final Propose propose, final String serverMsgId, final long timestamp) {
         final boolean originatedFromMyself = from.asBareJid().equals(id.account.getJid().asBareJid());
         if (originatedFromMyself) {
-            Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": saw proposal from mysql. ignoring");
+            Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": saw proposal from myself. ignoring");
         } else if (transition(State.PROPOSED, () -> {
             final Collection<RtpDescription> descriptions = Collections2.transform(
                     Collections2.filter(propose.getDescriptions(), d -> d instanceof RtpDescription),
@@ -571,7 +638,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
     private void startRinging() {
         Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": received call from " + id.with + ". start ringing");
         ringingTimeoutFuture = jingleConnectionManager.schedule(this::ringingTimeout, BUSY_TIME_OUT, TimeUnit.SECONDS);
-        xmppConnectionService.getNotificationService().showIncomingCallNotification(id, getMedia());
+        xmppConnectionService.getNotificationService().startRinging(id, getMedia());
     }
 
     private synchronized void ringingTimeout() {
@@ -595,7 +662,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
     }
 
-    private void receiveProceed(final Jid from, final String serverMsgId, final long timestamp) {
+    private void receiveProceed(final Jid from, final Proceed proceed, final String serverMsgId, final long timestamp) {
         final Set<Media> media = Preconditions.checkNotNull(this.proposedMedia, "Proposed media has to be set before handling proceed");
         Preconditions.checkState(media.size() > 0, "Proposed media should not be empty");
         if (from.equals(id.with)) {
@@ -605,6 +672,15 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                         this.message.setServerMsgId(serverMsgId);
                     }
                     this.message.setTime(timestamp);
+                    final Integer remoteDeviceId = proceed.getDeviceId();
+                    if (isOmemoEnabled()) {
+                        this.omemoVerification.setDeviceId(remoteDeviceId);
+                    } else {
+                        if (remoteDeviceId != null) {
+                            Log.d(Config.LOGTAG, id.account.getJid().asBareJid()+": remote party signaled support for OMEMO verification but we have OMEMO disabled");
+                        }
+                        this.omemoVerification.setDeviceId(null);
+                    }
                     this.sendSessionInitiate(media, State.SESSION_INITIALIZED_PRE_APPROVED);
                 } else {
                     Log.d(Config.LOGTAG, String.format("%s: ignoring proceed because already in %s", id.account.getJid().asBareJid(), this.state));
@@ -642,6 +718,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                 Log.d(Config.LOGTAG, "ignoring retract because already in " + this.state);
             }
         } else {
+            //TODO parse retract from self
             Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": received retract from " + from + ". expected retract from" + id.with + ". ignoring");
         }
     }
@@ -689,11 +766,29 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
     }
 
-    private void sendSessionInitiate(RtpContentMap rtpContentMap, final State targetState) {
+    private void sendSessionInitiate(final RtpContentMap rtpContentMap, final State targetState) {
         this.initiatorRtpContentMap = rtpContentMap;
         this.transitionOrThrow(targetState);
-        final JinglePacket sessionInitiate = rtpContentMap.toJinglePacket(JinglePacket.Action.SESSION_INITIATE, id.sessionId);
+        //TODO do on background thread?
+        final RtpContentMap outgoingContentMap = encryptSessionInitiate(rtpContentMap);
+        final JinglePacket sessionInitiate = outgoingContentMap.toJinglePacket(JinglePacket.Action.SESSION_INITIATE, id.sessionId);
         send(sessionInitiate);
+    }
+
+    private RtpContentMap encryptSessionInitiate(final RtpContentMap rtpContentMap) {
+        if (this.omemoVerification.hasDeviceId()) {
+            final AxolotlService.OmemoVerifiedPayload<OmemoVerifiedRtpContentMap> verifiedPayload;
+            try {
+                verifiedPayload = id.account.getAxolotlService().encrypt(rtpContentMap, id.with, omemoVerification.getDeviceId());
+            } catch (final CryptoFailedException e) {
+                Log.w(Config.LOGTAG,id.account.getJid().asBareJid()+": unable to use OMEMO DTLS verification on outgoing session initiate. falling back", e);
+                return rtpContentMap;
+            }
+            this.omemoVerification.setSessionFingerprint(verifiedPayload.getFingerprint());
+            return verifiedPayload.getPayload();
+        } else {
+            return rtpContentMap;
+        }
     }
 
     private void sendSessionTerminate(final Reason reason) {
@@ -830,6 +925,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                     return rtpConnectionStarted == 0 ? RtpEndUserState.CONNECTIVITY_ERROR : RtpEndUserState.CONNECTIVITY_LOST_ERROR;
                 }
             case REJECTED:
+            case REJECTED_RACED:
             case TERMINATED_DECLINED_OR_BUSY:
                 if (isInitiator()) {
                     return RtpEndUserState.DECLINED_OR_BUSY;
@@ -842,7 +938,11 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
             case TERMINATED_CANCEL_OR_TIMEOUT:
                 return RtpEndUserState.ENDED;
             case RETRACTED_RACED:
-                return RtpEndUserState.RETRACTED;
+                if (isInitiator()) {
+                    return RtpEndUserState.ENDED;
+                } else {
+                    return RtpEndUserState.RETRACTED;
+                }
             case TERMINATED_CONNECTIVITY_ERROR:
                 return rtpConnectionStarted == 0 ? RtpEndUserState.CONNECTIVITY_ERROR : RtpEndUserState.CONNECTIVITY_LOST_ERROR;
             case TERMINATED_APPLICATION_FAILURE:
@@ -878,6 +978,15 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         }
     }
 
+
+    public boolean isVerified() {
+        final String fingerprint = this.omemoVerification.getFingerprint();
+        if (fingerprint == null) {
+            return false;
+        }
+        final FingerprintStatus status = id.account.getAxolotlService().getFingerprintTrust(fingerprint);
+        return status != null && status.getTrust() == FingerprintStatus.Trust.VERIFIED;
+    }
 
     public synchronized void acceptCall() {
         switch (this.state) {
@@ -938,10 +1047,11 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
             return;
         }
         if (isInState(State.PROCEED)) {
-            Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": ending call while in state PROCEED just means ending the connection");
-            this.webRTCWrapper.close();
-            transitionOrThrow(State.TERMINATED_SUCCESS); //arguably this wasn't success; but not a real failure either
-            this.finish();
+            if (isInitiator()) {
+                retractFromProceed();
+            } else {
+                rejectCallFromProceed();
+            }
             return;
         }
         if (isInitiator() && isInState(State.SESSION_INITIALIZED, State.SESSION_INITIALIZED_PRE_APPROVED)) {
@@ -963,6 +1073,19 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
             return;
         }
         throw new IllegalStateException("called 'endCall' while in state " + this.state + ". isInitiator=" + isInitiator());
+    }
+
+    private void retractFromProceed() {
+        Log.d(Config.LOGTAG, "retract from proceed");
+        this.sendJingleMessage("retract");
+        closeTransitionLogFinish(State.RETRACTED_RACED);
+    }
+
+    private void closeTransitionLogFinish(final State state) {
+        this.webRTCWrapper.close();
+        transitionOrThrow(state);
+        writeLogMessage(state);
+        finish();
     }
 
     private void setupWebRTC(final Set<Media> media, final List<PeerConnection.IceServer> iceServers) throws WebRTCWrapper.InitializationException {
@@ -992,6 +1115,11 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
         finish();
     }
 
+    private void rejectCallFromProceed() {
+        this.sendJingleMessage("reject");
+        closeTransitionLogFinish(State.REJECTED_RACED);
+    }
+
     private void rejectCallFromSessionInitiate() {
         webRTCWrapper.close();
         sendSessionTerminate(Reason.DECLINE);
@@ -1004,14 +1132,27 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
 
     private void sendJingleMessage(final String action, final Jid to) {
         final MessagePacket messagePacket = new MessagePacket();
-        if ("proceed".equals(action)) {
-            messagePacket.setId(JINGLE_MESSAGE_PROCEED_ID_PREFIX + id.sessionId);
-        }
         messagePacket.setType(MessagePacket.TYPE_CHAT); //we want to carbon copy those
         messagePacket.setTo(to);
-        messagePacket.addChild(action, Namespace.JINGLE_MESSAGE).setAttribute("id", id.sessionId);
+        final Element intent = messagePacket.addChild(action, Namespace.JINGLE_MESSAGE).setAttribute("id", id.sessionId);
+        if ("proceed".equals(action)) {
+            messagePacket.setId(JINGLE_MESSAGE_PROCEED_ID_PREFIX + id.sessionId);
+            if (isOmemoEnabled()) {
+                final int deviceId = id.account.getAxolotlService().getOwnDeviceId();
+                final Element device = intent.addChild("device", Namespace.OMEMO_DTLS_SRTP_VERIFICATION);
+                device.setAttribute("id", deviceId);
+            }
+        }
         messagePacket.addChild("store", "urn:xmpp:hints");
         xmppConnectionService.sendMessagePacket(id.account, messagePacket);
+    }
+
+    private boolean isOmemoEnabled() {
+        final Conversational conversational = message.getConversation();
+        if (conversational instanceof Conversation) {
+            return ((Conversation) conversational).getNextEncryption() == Message.ENCRYPTION_AXOLOTL;
+        }
+        return false;
     }
 
     private void acceptCallFromSessionInitialized() {
