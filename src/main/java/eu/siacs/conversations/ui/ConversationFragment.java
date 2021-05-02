@@ -994,8 +994,9 @@ public class ConversationFragment extends XmppFragment implements EditMessage.Ke
                 } else {
                     menuOngoingCall.setVisible(false);
                     final RtpCapability.Capability rtpCapability = RtpCapability.check(conversation.getContact());
+                    final boolean cameraAvailable = activity != null && activity.isCameraFeatureAvailable();
                     menuCall.setVisible(rtpCapability != RtpCapability.Capability.NONE);
-                    menuVideoCall.setVisible(rtpCapability == RtpCapability.Capability.VIDEO);
+                    menuVideoCall.setVisible(rtpCapability == RtpCapability.Capability.VIDEO && cameraAvailable);
                 }
                 menuContactDetails.setVisible(!this.conversation.withSelf());
                 menuMucDetails.setVisible(false);
@@ -1605,7 +1606,7 @@ public class ConversationFragment extends XmppFragment implements EditMessage.Ke
     }
 
     private void createNewConnection(final Message message) {
-        if (!activity.xmppConnectionService.getHttpConnectionManager().checkConnection(message)) {
+        if (!activity.xmppConnectionService.hasInternetConnection()) {
             Toast.makeText(getActivity(), R.string.not_connected_try_again, Toast.LENGTH_SHORT).show();
             return;
         }

@@ -3,9 +3,12 @@ package eu.siacs.conversations;
 import android.graphics.Bitmap;
 import android.net.Uri;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
+import eu.siacs.conversations.crypto.XmppDomainVerifier;
 import eu.siacs.conversations.xmpp.Jid;
 import eu.siacs.conversations.xmpp.chatstate.ChatState;
 
@@ -33,7 +36,7 @@ public final class Config {
         return (ENCRYPTION_MASK & (ENCRYPTION_MASK - 1)) != 0;
     }
 
-    public static final String LOGTAG = BuildConfig.LOGTAG;
+    public static final String LOGTAG = BuildConfig.APP_NAME.toLowerCase(Locale.US);
 
     public static final Jid BUG_REPORTS = Jid.of("bugs@conversations.im");
     public static final Uri HELP = Uri.parse("https://help.conversations.im");
@@ -98,7 +101,7 @@ public final class Config {
 
     //remove *other* omemo devices from *your* device list announcement after not seeing any activity from them for 42 days. They will automatically add themselves after coming back online.
     public static final long OMEMO_AUTO_EXPIRY = 42 * MILLISECONDS_IN_DAY;
-    
+
     public static final boolean REMOVE_BROKEN_DEVICES = false;
     public static final boolean OMEMO_PADDING = false;
     public static final boolean PUT_AUTH_TAG_INTO_KEY = true;
@@ -106,6 +109,7 @@ public final class Config {
 
     public static final boolean USE_BOOKMARKS2 = false;
 
+    public static final boolean PROCESS_EXTMAP_ALLOW_MIXED = false;
     public static final boolean DISABLE_PROXY_LOOKUP = false; //useful to debug ibb
     public static final boolean USE_DIRECT_JINGLE_CANDIDATES = true;
     public static final boolean DISABLE_HTTP_UPLOAD = false;
@@ -175,7 +179,14 @@ public final class Config {
 
         //if the contacts domain matches one of the following domains OMEMO won’t be turned on automatically
         //can be used for well known, widely used gateways
-        public static final List<String> CONTACT_DOMAINS = Collections.singletonList("cheogram.com");
+        private static final List<String> CONTACT_DOMAINS = Arrays.asList(
+                "cheogram.com",
+                "*.covid.monal.im"
+        );
+
+        public static boolean matchesContactDomain(final String domain) {
+            return XmppDomainVerifier.matchDomain(domain, CONTACT_DOMAINS);
+        }
     }
 
     private Config() {

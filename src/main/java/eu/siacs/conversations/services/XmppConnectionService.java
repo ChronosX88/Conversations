@@ -20,6 +20,8 @@ import android.database.ContentObserver;
 import android.graphics.Bitmap;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Binder;
@@ -55,7 +57,6 @@ import org.openintents.openpgp.util.OpenPgpApi;
 import org.openintents.openpgp.util.OpenPgpServiceConnection;
 
 import java.io.File;
-import java.net.URL;
 import java.security.SecureRandom;
 import java.security.Security;
 import java.security.cert.CertificateException;
@@ -104,7 +105,6 @@ import eu.siacs.conversations.generator.AbstractGenerator;
 import eu.siacs.conversations.generator.IqGenerator;
 import eu.siacs.conversations.generator.MessageGenerator;
 import eu.siacs.conversations.generator.PresenceGenerator;
-import eu.siacs.conversations.http.CustomURLStreamHandlerFactory;
 import eu.siacs.conversations.http.HttpConnectionManager;
 import eu.siacs.conversations.parser.AbstractParser;
 import eu.siacs.conversations.parser.IqParser;
@@ -182,10 +182,6 @@ public class XmppConnectionService extends Service {
     private static final String ACTION_POST_CONNECTIVITY_CHANGE = "eu.siacs.conversations.POST_CONNECTIVITY_CHANGE";
 
     private static final String SETTING_LAST_ACTIVITY_TS = "last_activity_timestamp";
-
-    static {
-        URL.setURLStreamHandlerFactory(new CustomURLStreamHandlerFactory());
-    }
 
     public final CountDownLatch restoredFromDatabaseLatch = new CountDownLatch(1);
     private final SerialSingleThreadExecutor mFileAddingExecutor = new SerialSingleThreadExecutor("FileAdding");
@@ -663,6 +659,7 @@ public class XmppConnectionService extends Service {
                         if (Config.RESET_ATTEMPT_COUNT_ON_NETWORK_CHANGE) {
                             resetAllAttemptCounts(true, false);
                         }
+                        Resolver.clearCache();
                     }
                     break;
                 case Intent.ACTION_SHUTDOWN:
@@ -1080,11 +1077,20 @@ public class XmppConnectionService extends Service {
     }
 
     public boolean hasInternetConnection() {
-        final ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        final ConnectivityManager cm = ContextCompat.getSystemService(this, ConnectivityManager.class);
+        if (cm == null) {
+            return true; //if internet connection can not be checked it is probably best to just try
+        }
         try {
-            final NetworkInfo activeNetwork = cm == null ? null : cm.getActiveNetworkInfo();
-            return activeNetwork != null && (activeNetwork.isConnected() || activeNetwork.getType() == ConnectivityManager.TYPE_ETHERNET);
-        } catch (RuntimeException e) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                final Network activeNetwork = cm.getActiveNetwork();
+                final NetworkCapabilities capabilities = activeNetwork == null ? null : cm.getNetworkCapabilities(activeNetwork);
+                return capabilities != null && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+            } else {
+                final NetworkInfo networkInfo = cm.getActiveNetworkInfo();
+                return networkInfo != null && (networkInfo.isConnected() || networkInfo.getType() == ConnectivityManager.TYPE_ETHERNET);
+            }
+        } catch (final RuntimeException e) {
             Log.d(Config.LOGTAG, "unable to check for internet connection", e);
             return true; //if internet connection can not be checked it is probably best to just try
         }
@@ -1797,7 +1803,7 @@ public class XmppConnectionService extends Service {
             IqPacket request = mIqGenerator.deleteItem(Namespace.BOOKMARKS2, bookmark.getJid().asBareJid().toEscapedString());
             sendIqPacket(account, request, (a, response) -> {
                 if (response.getType() == IqPacket.TYPE.ERROR) {
-                    Log.d(Config.LOGTAG, a.getJid().asBareJid() + ": unable to delete bookmark " + response.getError());
+                    Log.d(Config.LOGTAG, a.getJid().asBareJid() + ": unable to delete bookmark " + response.getErrorCondition());
                 }
             });
         } else if (connection.getFeatures().bookmarksConversion()) {
@@ -2867,13 +2873,12 @@ public class XmppConnectionService extends Service {
                 }
 
                 @Override
-                public void onFetchFailed(final Conversation conversation, Element error) {
+                public void onFetchFailed(final Conversation conversation, final String errorCondition) {
                     if (conversation.getStatus() == Conversation.STATUS_ARCHIVED) {
                         Log.d(Config.LOGTAG, account.getJid().asBareJid() + ": conversation (" + conversation.getJid() + ") got archived before IQ result");
-
                         return;
                     }
-                    if (error != null && "remote-server-not-found".equals(error.getName())) {
+                    if ("remote-server-not-found".equals(errorCondition)) {
                         synchronized (account.inProgressConferenceJoins) {
                             account.inProgressConferenceJoins.remove(conversation);
                         }
@@ -3239,7 +3244,7 @@ public class XmppConnectionService extends Service {
                     Log.d(Config.LOGTAG, account.getJid().asBareJid() + ": received timeout waiting for conference configuration fetch");
                 } else {
                     if (callback != null) {
-                        callback.onFetchFailed(conversation, packet.getError());
+                        callback.onFetchFailed(conversation, packet.getErrorCondition());
                     }
                 }
             }
@@ -3443,15 +3448,23 @@ public class XmppConnectionService extends Service {
         }
     }
 
-    public void createContact(Contact contact, boolean autoGrant) {
+    public void createContact(final Contact contact, final boolean autoGrant) {
+        createContact(contact, autoGrant, null);
+    }
+
+    public void createContact(final Contact contact, final boolean autoGrant, final String preAuth) {
         if (autoGrant) {
             contact.setOption(Contact.Options.PREEMPTIVE_GRANT);
             contact.setOption(Contact.Options.ASKING);
         }
-        pushContactToServer(contact);
+        pushContactToServer(contact, preAuth);
     }
 
     public void pushContactToServer(final Contact contact) {
+        pushContactToServer(contact, null);
+    }
+
+    private void pushContactToServer(final Contact contact, final String preAuth) {
         contact.resetOption(Contact.Options.DIRTY_DELETE);
         contact.setOption(Contact.Options.DIRTY_PUSH);
         final Account account = contact.getAccount();
@@ -3467,7 +3480,7 @@ public class XmppConnectionService extends Service {
                 sendPresencePacket(account, mPresenceGenerator.sendPresenceUpdatesTo(contact));
             }
             if (ask) {
-                sendPresencePacket(account, mPresenceGenerator.requestPresenceUpdatesFrom(contact));
+                sendPresencePacket(account, mPresenceGenerator.requestPresenceUpdatesFrom(contact, preAuth));
             }
         } else {
             syncRoster(contact.getAccount());
@@ -3534,7 +3547,7 @@ public class XmppConnectionService extends Service {
                     if (publicationResponse.getType() == IqPacket.TYPE.RESULT) {
                         callback.onAvatarPublicationSucceeded();
                     } else {
-                        Log.d(Config.LOGTAG, "failed to publish vcard " + publicationResponse.getError());
+                        Log.d(Config.LOGTAG, "failed to publish vcard " + publicationResponse.getErrorCondition());
                         callback.onAvatarPublicationFailed(R.string.error_publish_avatar_server_reject);
                     }
                 });
@@ -3967,7 +3980,9 @@ public class XmppConnectionService extends Service {
                 if (message.getServerMsgId() == null) {
                     message.setServerMsgId(serverMessageId);
                 }
-                if (message.getEncryption() == Message.ENCRYPTION_NONE && isBodyModified(message, body)) {
+                if (message.getEncryption() == Message.ENCRYPTION_NONE
+                        && message.isTypeText()
+                        && isBodyModified(message, body)) {
                     message.setBody(body.content);
                     if (body.count > 1) {
                         message.setBodyLanguage(body.language);
@@ -4817,7 +4832,7 @@ public class XmppConnectionService extends Service {
     public interface OnConferenceConfigurationFetched {
         void onConferenceConfigurationFetched(Conversation conversation);
 
-        void onFetchFailed(Conversation conversation, Element error);
+        void onFetchFailed(Conversation conversation, String errorCondition);
     }
 
     public interface OnConferenceJoined {

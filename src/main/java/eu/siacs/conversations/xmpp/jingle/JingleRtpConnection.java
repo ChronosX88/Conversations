@@ -288,6 +288,9 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                 }
                 final String sdpMid = content.getKey();
                 final int mLineIndex = indices.indexOf(sdpMid);
+                if (mLineIndex < 0) {
+                    Log.w(Config.LOGTAG, "mLineIndex not found for " + sdpMid + ". available indices " + indices);
+                }
                 final IceCandidate iceCandidate = new IceCandidate(sdpMid, mLineIndex, sdp);
                 Log.d(Config.LOGTAG, "received candidate: " + iceCandidate);
                 this.webRTCWrapper.addIceCandidate(iceCandidate);
@@ -305,7 +308,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                 throw new SecurityException("Unable to verify DTLS Fingerprint with OMEMO", e);
             }
             this.omemoVerification.setOrEnsureEqual(omemoVerifiedPayload);
-            Log.d(Config.LOGTAG,id.account.getJid().asBareJid()+": received verifiable DTLS fingerprint via "+this.omemoVerification);
+            Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": received verifiable DTLS fingerprint via " + this.omemoVerification);
             return omemoVerifiedPayload.getPayload();
         } else if (expectVerification) {
             throw new SecurityException("DTLS fingerprint was unexpectedly not verifiable");
@@ -317,7 +320,16 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
     private void receiveSessionInitiate(final JinglePacket jinglePacket) {
         if (isInitiator()) {
             Log.d(Config.LOGTAG, String.format("%s: received session-initiate even though we were initiating", id.account.getJid().asBareJid()));
-            terminateWithOutOfOrder(jinglePacket);
+            if (isTerminated()) {
+                Log.d(Config.LOGTAG, String.format(
+                        "%s: got a reason to terminate with out-of-order. but already in state %s",
+                        id.account.getJid().asBareJid(),
+                        getState()
+                ));
+                respondWithOutOfOrder(jinglePacket);
+            } else {
+                terminateWithOutOfOrder(jinglePacket);
+            }
             return;
         }
         final RtpContentMap contentMap;
@@ -677,7 +689,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
                         this.omemoVerification.setDeviceId(remoteDeviceId);
                     } else {
                         if (remoteDeviceId != null) {
-                            Log.d(Config.LOGTAG, id.account.getJid().asBareJid()+": remote party signaled support for OMEMO verification but we have OMEMO disabled");
+                            Log.d(Config.LOGTAG, id.account.getJid().asBareJid() + ": remote party signaled support for OMEMO verification but we have OMEMO disabled");
                         }
                         this.omemoVerification.setDeviceId(null);
                     }
@@ -781,7 +793,7 @@ public class JingleRtpConnection extends AbstractJingleConnection implements Web
             try {
                 verifiedPayload = id.account.getAxolotlService().encrypt(rtpContentMap, id.with, omemoVerification.getDeviceId());
             } catch (final CryptoFailedException e) {
-                Log.w(Config.LOGTAG,id.account.getJid().asBareJid()+": unable to use OMEMO DTLS verification on outgoing session initiate. falling back", e);
+                Log.w(Config.LOGTAG, id.account.getJid().asBareJid() + ": unable to use OMEMO DTLS verification on outgoing session initiate. falling back", e);
                 return rtpContentMap;
             }
             this.omemoVerification.setSessionFingerprint(verifiedPayload.getFingerprint());
